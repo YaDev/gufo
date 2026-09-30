@@ -42,6 +42,9 @@
 #include "src/cli/serve/video_jobs.hpp"
 #include "src/cli/video/video.hpp"
 #include "src/models/qwen3_tts/audio.hpp"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace gufo::cli {
 namespace {
@@ -128,9 +131,6 @@ extern "C" void ReportFatalSignal(int number) {
 }
 
 #ifdef _WIN32
-
-#include <windows.h>
-#include <csignal>
 
 namespace {
 

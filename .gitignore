@@ -43,9 +43,11 @@
 build/
 Build/
 build-*/
+.idea
 
 # CMake generated files
 CMakeFiles/
+cmake-*
 CMakeCache.txt
 cmake_install.cmake
 Makefile

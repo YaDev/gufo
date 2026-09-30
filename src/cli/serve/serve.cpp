@@ -36,6 +36,7 @@
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime_api.h>
+#include "src/core/platform/device_memory.hpp"
 #endif
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_jobs.hpp"
@@ -73,7 +74,8 @@ public:
         << ' ' << details << ' ' << server::Logger::MemoryStatus();
 #if defined(ENGINE_ENABLE_HIP)
     std::size_t free = 0, total = 0;
-    if (gpu_loaded && hipMemGetInfo(&free, &total) == hipSuccess) {
+    if (gpu_loaded &&
+        gufo::platform::DeviceMemoryInfo(&free, &total) == hipSuccess) {
       out << " gpu_device_used_mib=" << (total - free) / (1024 * 1024)
           << " gpu_device_total_mib=" << total / (1024 * 1024);
     }
@@ -125,6 +127,71 @@ extern "C" void ReportFatalSignal(int number) {
   (void)::raise(number);
 }
 
+#ifdef _WIN32
+
+#include <windows.h>
+#include <csignal>
+
+namespace {
+
+LONG WINAPI ReportUnhandledException(
+    EXCEPTION_POINTERS* exception_info) {
+
+  if (exception_info == nullptr ||
+      exception_info->ExceptionRecord == nullptr) {
+    ReportFatalSignal(SIGABRT);
+    return EXCEPTION_CONTINUE_SEARCH;
+      }
+
+  const DWORD code =
+      exception_info->ExceptionRecord->ExceptionCode;
+
+  switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_IN_PAGE_ERROR:
+    case EXCEPTION_STACK_OVERFLOW:
+      ReportFatalSignal(SIGSEGV);
+    break;
+
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_PRIV_INSTRUCTION:
+      ReportFatalSignal(SIGILL);
+    break;
+
+    case EXCEPTION_FLT_DIVIDE_BY_ZERO:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_FLT_OVERFLOW:
+    case EXCEPTION_FLT_UNDERFLOW:
+    case EXCEPTION_FLT_INVALID_OPERATION:
+    case EXCEPTION_FLT_DENORMAL_OPERAND:
+      ReportFatalSignal(SIGFPE);
+    break;
+
+    case EXCEPTION_NONCONTINUABLE_EXCEPTION:
+      ReportFatalSignal(SIGABRT);
+    break;
+
+    default:
+      ReportFatalSignal(SIGABRT);
+    break;
+  }
+
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+}  // namespace
+
+void InstallFatalSignalReporter() {
+  (void)std::signal(SIGABRT, ReportFatalSignal);
+  (void)std::signal(SIGSEGV, ReportFatalSignal);
+  (void)std::signal(SIGILL, ReportFatalSignal);
+  (void)std::signal(SIGFPE, ReportFatalSignal);
+
+  (void)::SetUnhandledExceptionFilter(
+      ReportUnhandledException);
+}
+
+#else
 void InstallFatalSignalReporter() {
   struct sigaction action{};
   action.sa_handler = ReportFatalSignal;
@@ -134,7 +201,7 @@ void InstallFatalSignalReporter() {
     (void)::sigaction(number, &action, nullptr);
   }
 }
-
+#endif
 // Installs a terminate handler that names the reason before the process dies.
 // A HIP or driver failure during a load throws, and an exception that reaches
 // the top of main terminates without unwinding the stack, so ModelLoadLog's

@@ -10,8 +10,8 @@ versioned contract: supported fields behave as documented, and unsupported
 fields return explicit errors.
 
 Chat Completions is the main API, including streaming, images and tools.
-Responses supports text and image inputs with optional streaming; Anthropic Messages exposes a
-synchronous text subset.
+Responses supports text, images and function tools with optional streaming.
+Anthropic Messages exposes a synchronous text subset.
 The reference protocols are:
 
 - https://developers.openai.com/api/reference/resources/responses/methods/create/
@@ -107,7 +107,8 @@ their own settings.
 Use `--think off` or request `"reasoning_effort": "none"` to disable thinking.
 DeepSeek maps `minimal`/`low` to `low`, `medium`/`high`/`xhigh` to `high`,
 and `max` to `max`.
-The SDK check `--suite sampling-defaults --sampling-preset qwen38` (or
+The [functional suite](../tests/functional/README.md) with
+`--suite sampling-defaults --sampling-preset qwen38` (or
 `deepseek4`) compares omitted and explicit settings, including C2 replay.
 
 Sources: [Qwen27B](https://huggingface.co/Qwen/Qwen3.8-27B#best-practices),
@@ -214,7 +215,7 @@ Qwen27B at full context needs larger staging and `--cache-disk-bytes` limits;
 use the required size reported in the skip log.
 
 For a focused cancellation check, run
-`python3 tools/serving/check-continuation.py --output /tmp/cache-check.json`
+`python3 tests/functional/continuation.py --output /tmp/cache-check.json`
 against a private server named `cache-test` on port 5815.
 It checks interruption during reasoning and visible output, with and without
 reasoning replay, greedy/seeded sampling, and explicit cache bypass. Use
@@ -247,7 +248,9 @@ ceiling on one device, gufo or otherwise.
 Each server reads the queues already in use from
 `/sys/class/kfd/kfd/proc/*/queues/*/type`, which is world-readable and so
 includes processes gufo does not own, then exports `GPU_MAX_HW_QUEUES` before
-loading a model and logs a `queue_budget` event:
+loading a model and logs a `queue_budget` event. That event is INFO-tier and
+follows `--log-level` like the rest of the startup diagnostics; the
+`queue_budget_exceeded` warning below is WARN-tier:
 
 | Server | `GPU_MAX_HW_QUEUES` | Resident compute queues |
 | --- | ---: | ---: |
@@ -514,12 +517,15 @@ request limits, cancellation, cache accounting and completion state.
 
 `POST /v1/responses` accepts `model`, `input` as text or message arrays,
 `instructions`, `max_output_tokens`, `stream`, `reasoning.effort`,
-`text.format`, and the shared sampling controls. Message content supports
+`text.format`, `tools`, `tool_choice`, `parallel_tool_calls`, and the shared
+sampling controls. Message content supports
 `input_text` and `input_image` with an `image_url` (HTTPS or a data URL).
 Clients supply the complete conversation, including prior Gufo `output` items
-when retaining reasoning. `store` and `background` must be false
-when present. Tools, server-side conversations and `previous_response_id`
-remain unsupported on this route; use Chat Completions for tools.
+when retaining reasoning. Replay `function_call` items with their `call_id`,
+then supply `function_call_output` items using the same ID. Function tools use
+the flat `{type:"function",name,parameters,strict}` shape.
+`store` and `background` must be false when present; server-side conversations
+and `previous_response_id` remain unsupported.
 
 Responses report `incomplete` with reason `max_output_tokens` when generation
 hits its limit. Otherwise they report `completed`. `stream: true` sends typed
@@ -619,9 +625,15 @@ repetition penalty. Speculative rejection discards tentative counts; seeded
 sampling replay retains independent request histories.
 
 Tool calls are emitted only for declared functions when `tool_choice` allows
-calling tools. An unmet `required` choice returns `tool_choice_unsatisfied`
-(HTTP 502, or an SSE error after streaming starts), unless a requested stop
-sequence interrupted generation first.
+calling tools. With `auto`, ordinary text and reasoning remain allowed; once a
+call starts, decoding constrains its name and argument format. Non-strict tools
+keep optional arguments optional. Untyped arguments retain native best-effort
+semantics; schemas that cannot use native tags fall back to JSON.
+`tool_choice: "required"` constrains decoding to a declared call,
+so the requirement is forced rather than checked afterwards. Where the backend
+cannot constrain sampling, an unmet `required` choice still returns
+`tool_choice_unsatisfied` (HTTP 502, or an SSE error after streaming starts).
+Stops and token limits terminate normally without emitting incomplete calls.
 
 Stop sequences match accepted output bytes, including reasoning and tool
 markup, before streaming or response parsing. Partial prefixes are buffered;
@@ -671,19 +683,25 @@ characters in names and enum/const strings. Patterns use ECMA-262 Unicode
 semantics; lookbehind, backreferences, inline flags and unbounded repetition
 of assertions are unsupported.
 
-In Chat Completions, function `strict:true` constrains tool arguments independently
-of `response_format`.
+Function `strict:true` constrains tool arguments independently of the response
+schema. Chat Completions defaults to non-strict tools. Responses attempts strict
+schema normalization when `strict` is omitted, falling back to `strict:false`
+when unsupported; explicit `strict:false` keeps best-effort arguments.
 With `tool_choice: "auto"`, the model may call a tool or give a final answer;
 the response schema constrains the latter. Use `"none"` for JSON answers only,
-`"required"` to require a call, or select a named function.
-`parallel_tool_calls:false` allows at most one call. Interrupted calls are omitted.
+`"required"` to force a call, or select a named function.
+`"required"` and a named function constrain decoding regardless of tool
+strictness; `parallel_tool_calls:false` allows at most one call and constrains
+it likewise. Interrupted calls are omitted.
 
 References: [OpenAI Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create),
+[function calling](https://developers.openai.com/api/docs/guides/function-calling),
 [structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs),
 [JSON Schema patterns](https://json-schema.org/draft/2020-12/json-schema-validation#name-pattern)
 and [llama.cpp grammar sampling](https://github.com/ggml-org/llama.cpp/blob/68d9053afd4f4d0752ced6187585f862355a40be/common/sampling.cpp).
-Verify with `tools/serving/check-openai-sdk.py --suite structured` or
-`--suite structured-limits` (add `--vision` for an image-capable server).
+Verify with `tests/functional/openai_sdk.py --suite tools`,
+`--suite structured` or `--suite structured-limits`
+(add `--vision` for an image-capable server).
 
 ## Model Discovery
 
@@ -790,12 +808,65 @@ and automatic recovery after device reset or suspend/resume.
 Server lifecycle and request logs go to stderr. Each request gets an
 `X-Request-ID` response header matching its `request=rN` log entries. Inference
 requests log receipt and completion; streaming completion is logged after the
-stream ends. Successful health/metrics and video-status polls are quiet.
+stream ends. Successful health/metrics and video-status polls are quiet at the
+default level.
+
+Set verbosity with `--log-level <error|warn|info|debug>` (default `info`);
+`-v`/`--verbose` is shorthand for `--log-level=debug` and cannot combine with
+the canonical spelling — passing both is a usage error rather than a precedence
+to guess at. Each tier is a threshold, not only an addition:
+`--log-level error` shows ERROR lines alone, so a 5xx response or stream
+failure still logs while a 4xx refusal, which logs at WARN (a 429 admission
+refusal included), is filtered out.
+
+The threshold also covers the lifecycle lines. `event=listening` (the bound
+address, auth mode and connection limits) and `event=shutdown_requested` (the
+signal that asked for a stop) are INFO-tier, so `--log-level=warn` and
+`--log-level=error` start and stop with no output at all. Keep the default
+`info` for systemd units and CI that read the startup banner, or confirm boot
+with `GET /health` or `GET /ready`.
+
+The `debug` tier adds:
+
+- the resolved server options as `event=options` before the model opens, with
+  `api_key=set` rather than the key. This line and the `event=listening` banner
+  are separate on purpose: the banner only appears once the model has loaded and
+  the listener is accepting, so a load that fails or hangs leaves
+  `event=options` as the sole record of what was asked for;
+- completion logs for the polls that are quiet by default, and `event=received`
+  for GET requests;
+- scheduler decisions: `event=admitted` with the pending queue depth and the
+  per-client depth the request joined, `event=admission_refused` naming the limit
+  that rejected it and the client, and `event=backpressure` once per stream
+  naming which output budget refused a token (`request_buffer` or
+  `total_buffer`) with the byte counts;
+- cache candidate detail behind the summarised lines: `event=candidate_skip`
+  gives the entry index, its token length and the first guard that failed
+  (`unavailable`, `input_identity`, `stable_prefix_boundary` or
+  `token_prefix`), and `event=capture_evicts` names the checkpoint a capture is
+  about to overwrite. A request that finds every slot busy emits its skip
+  records once, so a long wait does not repeat them on every 10ms poll.
+
+Loader phases stay at INFO: the weight-mapping and session-preallocation work is
+HIP-only code, so deeper sub-phases there need a GPU build to verify and are not
+part of this tier. The imported DeepSeek V4 Flash runtime logs through the same
+threshold rather than writing to stderr directly, so its informational startup
+lines (the ROCm model-cache and managed-KV lines, DSpark attachment, the shared
+batch workspace) are suppressed by `--log-level=warn`/`error` too.
+
+Prompt text, message bodies and API keys stay unlogged at every level, and debug
+lines use the same escaping and redaction as the rest of the log. Client
+identity is the exception: scheduler admission lines name a client by the peer
+address of its socket (`client_id=127.0.0.1` on the default loopback bind), so a
+public `--host` writes client IP addresses into the debug tier.
 
 Pass `--log-progress` to `gufo serve llm` to log each prefill chunk, each
 50-token decode boundary, and the final decode remainder. Each line includes the
 request ID, completed and total tokens, percentage, current speed and average
-speed. Speculative requests also include accepted and proposed drafts.
+speed. Speculative requests also include accepted and proposed drafts. Progress
+lines are INFO-tier: `--log-level=warn` or `--log-level=error` would discard
+them, so the server rejects that combination at startup instead of ignoring the
+flag.
 
 Text completion logs include stop/length/cancellation, queue and first-token
 latency, prefill/decode speed, execution width, memory/disk cache hits and reused
@@ -837,9 +908,12 @@ lazily in the worker. Control characters are escaped in log lines.
 
 - `json_test`: number precision, Unicode escapes, malformed input and depth limits.
 - `http_server_test`: transport framing, authentication, compatibility validation,
-  sampling forwarding, request logs and streaming failures without loading a model.
+  sampling forwarding, request logs at the default and debug tiers, and streaming
+  failures without loading a model.
+- `serve_cli_test`: executable help, argument wiring and rejected configurations,
+  including that `--log-level` and `-v` change the emitted log rather than only
+  parsing.
 - `openai_chat_test`: chat parsing, streaming, images, tools and sampling controls.
-- `serve_cli_test`: executable help, argument wiring and rejected configurations.
 - Per-model serving tests: greedy/sampled decoding, batching, cache reuse and
   cancellation. Use the affected model's benchmark README for commands and limits.
 

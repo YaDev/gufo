@@ -1,6 +1,7 @@
 #include "src/cli/serve/http_server.hpp"
 
 #include <arpa/inet.h>
+#include <spawn.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -9,6 +10,7 @@
 #include <cassert>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -16,9 +18,11 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include "src/cli/serve/logging.hpp"
+#include "src/core/platform/socket.hpp"
 
 namespace {
 
@@ -192,9 +196,8 @@ public:
   int Connect() {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     assert(fd >= 0);
-    const timeval timeout{3, 0};
-    assert(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                        sizeof(timeout)) == 0);
+    assert(gufo::platform::SetSocketTimeout(fd, SO_RCVTIMEO,
+                                            std::chrono::seconds{3}) == 0);
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(server.port());
@@ -887,41 +890,59 @@ void TestStreamingFraming() {
          std::string("a\0bend", 6));
 }
 
+const char* g_self = "http_server_test";
+
+void RunSignalChild(int signal, bool active) {
+  RunningServer server({}, true);
+  // Accepting a request proves run() installed its handlers.
+  ExpectStatus(server.Post("/echo", "ready"), 200);
+  int fd = -1;
+  if (active) {
+    server.backend->wait_for_disconnect = true;
+    fd = server.Connect();
+    const std::string body = R"({"prompt":"hello"})";
+    const std::string request =
+        "POST /v1/completions HTTP/1.1\r\nContent-Length: " +
+        std::to_string(body.size()) + "\r\n\r\n" + body;
+    assert(::send(fd, request.data(), request.size(), MSG_NOSIGNAL) ==
+           static_cast<ssize_t>(request.size()));
+    assert(server.backend->entered.try_acquire_for(std::chrono::seconds(2)));
+  }
+  assert(::kill(::getpid(), signal) == 0);
+  assert(server.run_finished.try_acquire_for(std::chrono::seconds(2)));
+  if (active) {
+    assert(server.backend->disconnected);
+    ::close(fd);
+  }
+}
+
 void TestSignalShutdown() {
   // Process signals must never terminate the test runner itself. Prove that
   // both idle listeners and active generation return through normal cleanup.
   for (const int signal : {SIGINT, SIGTERM}) {
     for (const bool active : {false, true}) {
+#ifdef _WIN32
+      // No fork(): re-enter this binary to run exactly this scenario. The
+      // compat kill() delivers to the installed handler, the same one the
+      // console shutdown events reach in a real server process.
+      pid_t child = -1;
+      const std::string signal_text = std::to_string(signal);
+      char marker[] = "--signal-child";
+      char active_text[] = {active ? '1' : '0', '\0'};
+      char* const child_argv[] = {const_cast<char*>(g_self), marker,
+                                  const_cast<char*>(signal_text.c_str()),
+                                  active_text, nullptr};
+      assert(::posix_spawn(&child, g_self, nullptr, nullptr, child_argv,
+                           nullptr) == 0);
+#else
       const pid_t child = ::fork();
       assert(child >= 0);
       if (child == 0) {
         ::alarm(5);
-        {
-          RunningServer server({}, true);
-          // Accepting a request proves run() installed its handlers.
-          ExpectStatus(server.Post("/echo", "ready"), 200);
-          int fd = -1;
-          if (active) {
-            server.backend->wait_for_disconnect = true;
-            fd = server.Connect();
-            const std::string body = R"({"prompt":"hello"})";
-            const std::string request =
-                "POST /v1/completions HTTP/1.1\r\nContent-Length: " +
-                std::to_string(body.size()) + "\r\n\r\n" + body;
-            assert(::send(fd, request.data(), request.size(), MSG_NOSIGNAL) ==
-                   static_cast<ssize_t>(request.size()));
-            assert(server.backend->entered.try_acquire_for(
-                std::chrono::seconds(2)));
-          }
-          assert(::kill(::getpid(), signal) == 0);
-          assert(server.run_finished.try_acquire_for(std::chrono::seconds(2)));
-          if (active) {
-            assert(server.backend->disconnected);
-            ::close(fd);
-          }
-        }
+        RunSignalChild(signal, active);
         ::_exit(0);
       }
+#endif
       int status = 0;
       assert(::waitpid(child, &status, 0) == child);
       assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
@@ -929,9 +950,61 @@ void TestSignalShutdown() {
   }
 }
 
+void TestStopReapsIdleConnections() {
+  // stop() must never wait out the socket read timeout: run() joins its
+  // connection workers, and an idle keep-alive worker is parked in a read.
+  RunningServer server;
+  const int fd = server.Connect();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  const auto begin = std::chrono::steady_clock::now();
+  server.server.stop();
+  assert(server.run_finished.try_acquire_for(std::chrono::seconds(2)));
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - begin)
+                           .count();
+  assert(elapsed < 1000);
+  ::close(fd);
+}
+
+void TestPortRebindAfterConnections() {
+  // A fast restart must take its port back while the previous instance's
+  // closed connections are still in TIME_WAIT, like docker-style restarts.
+  int port = 0;
+  {
+    RunningServer first;
+    port = first.server.port();
+    for (int i = 0; i < 8; ++i)
+      ExpectStatus(first.Post("/echo", "x"), 200);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  HttpServer restart("127.0.0.1", port, nullptr);
+  std::string error;
+  if (!restart.start(&error)) {
+    std::cerr << "restart could not rebind freshly closed port " << port << ": "
+              << error << '\n';
+    std::abort();
+  }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  g_self = argv[0];
+#ifdef _WIN32
+  if (argc == 4 && std::string_view(argv[1]) == "--signal-child") {
+    // Stand-in for alarm(5): bound the scenario without stalling the suite.
+    std::thread watchdog([] {
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+      ::_exit(3);
+    });
+    watchdog.detach();
+    RunSignalChild(std::atoi(argv[2]), std::atoi(argv[3]) != 0);
+    ::_exit(0);
+  }
+#else
+  (void)argc;
+  (void)argv;
+#endif
   TestRequestLogging();
   TestInvalidBindSettings();
   TestQueryParameters();
@@ -946,5 +1019,7 @@ int main() {
   TestPeerDisconnect();
   TestStreamingFraming();
   TestSignalShutdown();
+  TestStopReapsIdleConnections();
+  TestPortRebindAfterConnections();
   std::cout << "HTTP transport checks passed.\n";
 }

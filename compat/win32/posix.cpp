@@ -735,6 +735,31 @@ bool PipeReady(HANDLE handle, SHORT requested, SHORT* revents) {
   return false;
 }
 
+// Winsock error values do not overlap the Win32 range mapped by
+// ErrnoFromWin32(); POSIX socket code checks these instead.
+int WinsockToErrno(int error) {
+  switch (error) {
+    case WSAEWOULDBLOCK:
+      return EAGAIN;
+    case WSAEINTR:
+      return EINTR;
+    case WSAECONNRESET:
+    case WSAECONNABORTED:
+      return ECONNRESET;
+    case WSAESHUTDOWN:
+      return EPIPE;
+    case WSAEINVAL:
+      return EINVAL;
+    default:
+      return EIO;
+  }
+}
+
+int SocketChunkLength(size_t count) {
+  return count > static_cast<size_t>(INT_MAX) ? INT_MAX
+                                              : static_cast<int>(count);
+}
+
 bool OtherReady(FdKind kind, SHORT requested, SHORT* revents) {
   if (kind == kFdInvalid) {
     *revents = POLLNVAL;
@@ -748,6 +773,59 @@ bool OtherReady(FdKind kind, SHORT requested, SHORT* revents) {
   // ReadConsoleInput, which consumes the event, so reads are never-ready.
   *revents = (requested & POLLOUT) != 0 ? POLLOUT : 0;
   return *revents != 0;
+}
+
+// ---- signal() handlers reachable from console control events ----------------
+
+// The CRT raises SIGINT for Ctrl+C on a private thread ~5 s before the
+// console is killed, and nothing else for window close, logoff, shutdown or
+// a supervisor stop. A SetConsoleCtrlHandler closes that gap: the events
+// arrive on their own thread while the grace timer runs, and the handler
+// delivers the signal that handlers installed through sigaction() expect.
+// Installed handlers must stay async-signal-safe, like on POSIX.
+constexpr int kInstalledSignalSlots = 64;
+std::atomic<void (*)(int)> g_installed_signals[kInstalledSignalSlots]{};
+
+void DeliverInstalledSignal(int sig) {
+  if (sig <= 0 || sig >= kInstalledSignalSlots) {
+    return;
+  }
+  void (*handler)(int) =
+      g_installed_signals[sig].load(std::memory_order_acquire);
+  if (handler == nullptr || handler == SIG_DFL || handler == SIG_IGN) {
+    return;
+  }
+  handler(sig);
+}
+
+BOOL WINAPI ConsoleControlHandler(DWORD control) {
+  switch (control) {
+    case CTRL_C_EVENT:
+      DeliverInstalledSignal(SIGINT);
+      return TRUE;
+    case CTRL_BREAK_EVENT:
+      // Container and job supervisors send BREAK as the graceful stop,
+      // matching how they would send SIGTERM on Linux.
+      DeliverInstalledSignal(SIGINT);
+      DeliverInstalledSignal(SIGTERM);
+      return TRUE;
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+      DeliverInstalledSignal(SIGTERM);
+      return TRUE;
+    default:
+      return FALSE;
+  }
+}
+
+void EnableConsoleControlHandler() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    // A process detached from every console simply never receives these
+    // events; a failed registration must not fail the signal install.
+    (void)SetConsoleCtrlHandler(ConsoleControlHandler, TRUE);
+  });
 }
 
 }  // namespace
@@ -796,6 +874,14 @@ int openat(int dirfd, const char* path, int flags, ...) {
 }
 
 int close(int fd) {
+  if (KindOf(fd) == kFdSocket) {
+    ForgetFlags(fd);
+    if (::closesocket(static_cast<SOCKET>(fd)) == 0) {
+      return 0;
+    }
+    errno = WinsockToErrno(WSAGetLastError());
+    return -1;
+  }
   const HANDLE handle = HandleOf(fd);
   if (handle == INVALID_HANDLE_VALUE) {
     errno = EBADF;
@@ -812,10 +898,30 @@ int close(int fd) {
 }
 
 ssize_t read(int fd, void* buf, size_t count) {
+  if (KindOf(fd) == kFdSocket) {
+    const int n = ::recv(static_cast<SOCKET>(fd), static_cast<char*>(buf),
+                         SocketChunkLength(count), 0);
+    if (n == SOCKET_ERROR) {
+      errno = WinsockToErrno(WSAGetLastError());
+      return -1;
+    }
+    return n;
+  }
   return Stream(fd, buf, count, false);
 }
 
 ssize_t write(int fd, const void* buf, size_t count) {
+  if (KindOf(fd) == kFdSocket) {
+    // Winsock send() never raises on a dead peer, like Linux with
+    // MSG_NOSIGNAL, which is what every Gufo socket writer asks for.
+    const int n = ::send(static_cast<SOCKET>(fd), static_cast<const char*>(buf),
+                         SocketChunkLength(count), 0);
+    if (n == SOCKET_ERROR) {
+      errno = WinsockToErrno(WSAGetLastError());
+      return -1;
+    }
+    return n;
+  }
   return Stream(fd, const_cast<void*>(buf), count, true);
 }
 
@@ -1739,6 +1845,19 @@ pid_t waitpid(pid_t pid, int* status, int options) {
 }
 
 int kill(pid_t pid, int sig) {
+  if (sig != 0 && pid == static_cast<pid_t>(GetCurrentProcessId())) {
+    // Signalling oneself must reach the installed handler: TerminateProcess
+    // would turn a graceful shutdown into a hard kill, the exact failure
+    // docker stop must not reproduce. Without a handler there is nothing to
+    // deliver, and the default-dispatch path below stays closest to POSIX.
+    const bool installed =
+        sig < kInstalledSignalSlots &&
+        g_installed_signals[sig].load(std::memory_order_acquire) != nullptr;
+    if (installed) {
+      DeliverInstalledSignal(sig);
+      return 0;
+    }
+  }
   HANDLE process = nullptr;
   {
     std::lock_guard lock(g_child_mutex);
@@ -1784,6 +1903,13 @@ int sigaction(int sig, const struct sigaction* action,
   }
   if (previous != nullptr) {
     previous->sa_handler = old;
+  }
+  if (sig > 0 && sig < kInstalledSignalSlots) {
+    g_installed_signals[sig].store(handler, std::memory_order_release);
+  }
+  if ((sig == SIGINT || sig == SIGTERM) && handler != SIG_DFL &&
+      handler != SIG_IGN) {
+    EnableConsoleControlHandler();
   }
   return 0;
 }

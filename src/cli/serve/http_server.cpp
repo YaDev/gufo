@@ -12,10 +12,12 @@
 #include <cctype>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -92,10 +94,43 @@ private:
 // Socket I/O helpers
 // ---------------------------------------------------------------------------
 
-bool ReadUntil(std::string& out, int fd, std::string_view delim) {
+// Maximum quiet time before a request is abandoned. Readers never block for
+// it in one piece: they wait in kStopSlice-sized polls and re-check the
+// server's stop flag between slices, because a Winsock shutdown() cannot
+// wake a thread already blocked in recv().
+constexpr auto kSocketIdleTimeout = std::chrono::seconds{120};
+constexpr auto kStopSlice = std::chrono::milliseconds{50};
+
+// A sliced interruptible read: returns bytes > 0, 0 when the request is
+// abandoned (stopping or idle timeout), never a blocking stall.
+ssize_t ReadSocket(int fd, char* buf, std::size_t size,
+                   const std::function<bool()>& stopping,
+                   std::chrono::steady_clock::time_point& idle_since) {
+  while (true) {
+    if (!gufo::platform::WaitReadable(fd, kStopSlice)) {
+      if (stopping())
+        return 0;
+      if (std::chrono::steady_clock::now() - idle_since > kSocketIdleTimeout)
+        return 0;
+      continue;
+    }
+    const ssize_t n = gufo::platform::SocketRead(fd, buf, size);
+    if (n > 0) {
+      idle_since = std::chrono::steady_clock::now();
+      return n;
+    }
+    if (n < 0 && (errno == EAGAIN || errno == EINTR))
+      continue;  // Spurious readiness; the slice wait keeps stop() prompt.
+    return 0;
+  }
+}
+
+bool ReadUntil(std::string& out, int fd, std::string_view delim,
+               const std::function<bool()>& stopping) {
   char buf[4096];
+  auto idle_since = std::chrono::steady_clock::now();
   while (out.find(delim) == std::string::npos) {
-    const ssize_t n = gufo::platform::SocketRead(fd, buf, sizeof(buf));
+    const ssize_t n = ReadSocket(fd, buf, sizeof(buf), stopping, idle_since);
     if (n <= 0)
       return false;
     out.append(buf, static_cast<std::size_t>(n));
@@ -105,13 +140,15 @@ bool ReadUntil(std::string& out, int fd, std::string_view delim) {
   return true;
 }
 
-bool ReadN(std::string& out, int fd, std::size_t n) {
+bool ReadN(std::string& out, int fd, std::size_t n,
+           const std::function<bool()>& stopping) {
   out.reserve(n);
   std::size_t got = 0;
   char buf[4096];
+  auto idle_since = std::chrono::steady_clock::now();
   while (got < n) {
     const std::size_t want = std::min(sizeof(buf), n - got);
-    const ssize_t r = gufo::platform::SocketRead(fd, buf, want);
+    const ssize_t r = ReadSocket(fd, buf, want, stopping, idle_since);
     if (r <= 0)
       return false;
     out.append(buf, static_cast<std::size_t>(r));
@@ -150,30 +187,19 @@ bool SendChunk(int fd, std::string_view data) {
 }
 
 bool IsPeerDisconnected(int fd) noexcept {
-  pollfd descriptor{
-      .fd = static_cast<decltype(pollfd::fd)>(fd),
-      .events = POLLIN | POLLERR | POLLHUP,
-      .revents = 0,
-  };
-#ifdef POLLRDHUP
-  descriptor.events |= POLLRDHUP;
-#endif
-  const int ready = ::poll(&descriptor, 1, 0);
-  if (ready <= 0)
+  if (!gufo::platform::SocketReadableOrClosed(fd))
     return false;
-  if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
-    return true;
-#ifdef POLLRDHUP
-  if ((descriptor.revents & POLLRDHUP) != 0)
-    return true;
-#endif
-  if ((descriptor.revents & POLLIN) == 0)
-    return false;
-  char byte;
-  const auto count =
-      gufo::platform::SocketRecv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
-  return count == 0 || (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
-                        errno != EINTR);
+  char byte = 0;
+  switch (gufo::platform::PeekByteNonBlocking(fd, &byte)) {
+    case gufo::platform::Peek::kPeerClosed:
+      return true;
+    case gufo::platform::Peek::kError:
+      return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+    case gufo::platform::Peek::kByte:
+    case gufo::platform::Peek::kNoData:
+      return false;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1225,20 +1251,15 @@ bool HttpServer::start(std::string* error) {
       *error = "socket() failed";
     return false;
   }
-  const int yes = 1;
-#ifdef _WIN32
-  // Windows SO_REUSEADDR lets another process steal a bound port; exclusive
-  // use is the Linux SO_REUSEADDR behavior for a listening server.
-  gufo::platform::SetSocketOption(listen_fd_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
-                                  yes);
-#else
-  ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-#endif
-
-  if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) <
-      0) {
+  const auto bound = gufo::platform::BindListener(
+      listen_fd_, *reinterpret_cast<const sockaddr*>(&addr));
+  if (bound != gufo::platform::ListenerBind::kBound) {
     if (error != nullptr) {
-      *error = "bind() failed on " + host_ + ":" + std::to_string(port_);
+      *error = bound == gufo::platform::ListenerBind::kBusy
+                   ? "bind() failed on " + host_ + ":" + std::to_string(port_) +
+                         ": the port is still held by a previous instance or "
+                         "another process"
+                   : "bind() failed on " + host_ + ":" + std::to_string(port_);
     }
     gufo::platform::CloseSocket(listen_fd_);
     listen_fd_ = -1;
@@ -1345,11 +1366,18 @@ void HttpServer::run(bool handle_signals) {
         worker_ptr->fd = client_fd;
         worker_ptr->thread = std::jthread([this, worker_ptr, client_fd] {
           handle_connection(client_fd);
+          int closing = -1;
           {
+            // Claim the descriptor under the mutex so stop() can never see
+            // a closed-and-reused value, then drain and close outside it:
+            // the bounded drain must not serialize teardown behind
+            // workers_mutex_.
             const std::lock_guard<std::mutex> lock(workers_mutex_);
-            gufo::platform::CloseConnection(worker_ptr->fd);
+            closing = worker_ptr->fd;
             worker_ptr->fd = -1;
           }
+          if (closing >= 0)
+            gufo::platform::CloseConnection(closing);
           worker_ptr->done.store(true, std::memory_order_release);
         });
         workers_.push_back(std::move(worker));
@@ -1502,9 +1530,11 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
 }
 
 void HttpServer::handle_connection(int client_fd) {
-  constexpr std::chrono::seconds kSocketTimeout{120};
-  gufo::platform::SetSocketTimeout(client_fd, SO_RCVTIMEO, kSocketTimeout);
-  gufo::platform::SetSocketTimeout(client_fd, SO_SNDTIMEO, kSocketTimeout);
+  gufo::platform::SetSocketTimeout(client_fd, SO_RCVTIMEO, kSocketIdleTimeout);
+  gufo::platform::SetSocketTimeout(client_fd, SO_SNDTIMEO, kSocketIdleTimeout);
+  const std::function<bool()> stopping = [this] {
+    return stopped_.load(std::memory_order_acquire);
+  };
 
   const auto start_time = std::chrono::steady_clock::now();
   HttpRequest req;
@@ -1530,7 +1560,7 @@ void HttpServer::handle_connection(int client_fd) {
     bool payload_too_large = false;
     {
       std::string buffer;
-      if (ReadUntil(buffer, client_fd, "\r\n\r\n")) {
+      if (ReadUntil(buffer, client_fd, "\r\n\r\n", stopping)) {
         // ReadUntil over-reads: `buffer` holds the headers, the blank line, and
         // possibly some body bytes already. Split at the blank line and carry
         // the over-read body bytes forward so we only read the remainder from
@@ -1601,7 +1631,7 @@ void HttpServer::handle_connection(int client_fd) {
           payload_too_large = true;
         } else if (content_length > 0) {
           if (remaining > 0) {
-            ok = ReadN(body, client_fd, remaining);
+            ok = ReadN(body, client_fd, remaining, stopping);
           } else {
             ok = true;
           }

@@ -48,6 +48,12 @@ inline void SetErrnoFromSocketError() noexcept {
     case WSAENOTSOCK:
       errno = EBADF;
       break;
+    case WSAEADDRINUSE:
+      errno = EADDRINUSE;
+      break;
+    case WSAEACCES:
+      errno = EACCES;
+      break;
     default:
       errno = EIO;
       break;
@@ -69,28 +75,40 @@ inline int CloseSocket(int fd) noexcept {
 #endif
 }
 
+/// Waits up to `timeout` for `fd` to become readable (or closed/errored).
+inline bool WaitReadable(int fd, std::chrono::milliseconds timeout) noexcept {
+#ifdef _WIN32
+  WSAPOLLFD readable{static_cast<SOCKET>(fd), POLLRDNORM, 0};
+  return ::WSAPoll(&readable, 1, static_cast<INT>(timeout.count())) != 0;
+#else
+  pollfd readable{fd, POLLIN, 0};
+  return ::poll(&readable, 1, static_cast<int>(timeout.count())) != 0;
+#endif
+}
+
 /// Closes an accepted connection. Closing with unread input sends a TCP
 /// reset on both platforms, but Linux still lets the peer read what arrived
 /// before it while Windows discards it, losing a final response or close
-/// frame. On Windows, finish sending, drain briefly, then close.
+/// frame. On Windows, finish sending, drain briefly, then close. The drain
+/// is bounded by wall clock, not by a round counter, so a chatty peer cannot
+/// stretch a teardown; callers still must not hold a teardown mutex across
+/// this call.
 inline int CloseConnection(int fd) noexcept {
 #ifdef _WIN32
   const auto socket = static_cast<SOCKET>(fd);
   (void)::shutdown(socket, SD_SEND);
-  u_long non_blocking = 1;
-  (void)::ioctlsocket(socket, FIONBIO, &non_blocking);
+  constexpr auto kDrainBudget = std::chrono::milliseconds(200);
+  const auto deadline = std::chrono::steady_clock::now() + kDrainBudget;
   char sink[4096];
-  for (int round = 0; round < 50; ++round) {
+  while (std::chrono::steady_clock::now() < deadline) {
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+    if (!WaitReadable(fd, remaining))
+      break;  // Quiet for the whole budget: the peer has what we sent.
     const int n = ::recv(socket, sink, sizeof(sink), 0);
-    if (n == 0)
-      break;  // Peer finished too: an orderly close.
-    if (n < 0) {
-      if (::WSAGetLastError() != WSAEWOULDBLOCK)
-        break;
-      WSAPOLLFD readable{socket, POLLRDNORM, 0};
-      if (::WSAPoll(&readable, 1, 10) <= 0 && round >= 10)
-        break;  // Quiet for a while: the peer has what we sent.
-    }
+    if (n <= 0)
+      break;  // Orderly close, reset or error: nothing more to preserve.
   }
   return ::closesocket(socket);
 #else
@@ -101,22 +119,13 @@ inline int CloseConnection(int fd) noexcept {
 /// Wakes a thread blocked reading `fd` and stops further reads, keeping the
 /// send half usable. Linux does this with shutdown(SHUT_RD). Winsock resets
 /// the connection when data arrives after SD_RECEIVE, which would discard
-/// frames the peer has not read yet; Windows readers instead wait in short
-/// WaitReadable slices and re-check their own stop flag, so this is a no-op.
+/// frames the peer has not read yet, and neither shutdown() nor CancelIoEx
+/// reliably wakes a blocking recv(); every Windows reader therefore waits
+/// in short WaitReadable slices and re-checks its own stop flag, so this is
+/// a no-op.
 inline void StopSocketReads([[maybe_unused]] int fd) noexcept {
 #ifndef _WIN32
   (void)::shutdown(fd, SHUT_RD);
-#endif
-}
-
-/// Waits up to `timeout` for `fd` to become readable (or closed/errored).
-inline bool WaitReadable(int fd, std::chrono::milliseconds timeout) noexcept {
-#ifdef _WIN32
-  WSAPOLLFD readable{static_cast<SOCKET>(fd), POLLRDNORM, 0};
-  return ::WSAPoll(&readable, 1, static_cast<INT>(timeout.count())) != 0;
-#else
-  pollfd readable{fd, POLLIN, 0};
-  return ::poll(&readable, 1, static_cast<int>(timeout.count())) != 0;
 #endif
 }
 
@@ -167,6 +176,119 @@ int SetSocketOption(int fd, int level, int name, const T& value) noexcept {
                       static_cast<int>(sizeof(value)));
 #else
   return ::setsockopt(fd, level, name, &value, sizeof(value));
+#endif
+}
+
+enum class ListenerBind {
+  kBound,
+  kBusy,    // The port is held by a live listener or a TIME_WAIT socket.
+  kFailed,  // errno carries the reason.
+};
+
+/// Sets the reuse option and binds a listening socket.
+/// Linux: SO_REUSEADDR, so an immediate restart succeeds while closed
+/// connections of the previous instance are still TIME_WAIT.
+/// Windows: SO_REUSEADDR means something different there - it lets another
+/// process hijack a bound port - so bind exclusively first; if an old
+/// TIME_WAIT connection blocks the rebind, drop back to reuse, which still
+/// refuses the port from a live listener. setsockopt results are not checked
+/// here; the bind result reports every condition callers can act on.
+inline ListenerBind BindListener(int fd, const sockaddr& address) noexcept {
+#ifdef _WIN32
+  const SOCKET socket = static_cast<SOCKET>(fd);
+  const int exclusive = 1;
+  (void)SetSocketOption(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, exclusive);
+  if (::bind(socket, &address, static_cast<int>(sizeof(address))) == 0)
+    return ListenerBind::kBound;
+  if (::WSAGetLastError() != WSAEADDRINUSE) {
+    detail::SetErrnoFromSocketError();
+    return ListenerBind::kFailed;
+  }
+  const int off = 0;
+  const int on = 1;
+  (void)SetSocketOption(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, off);
+  (void)SetSocketOption(fd, SOL_SOCKET, SO_REUSEADDR, on);
+  if (::bind(socket, &address, static_cast<int>(sizeof(address))) == 0)
+    return ListenerBind::kBound;
+  detail::SetErrnoFromSocketError();
+  return errno == EADDRINUSE ? ListenerBind::kBusy : ListenerBind::kFailed;
+#else
+  const int on = 1;
+  (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+  if (::bind(fd, &address, sizeof(address)) == 0)
+    return ListenerBind::kBound;
+  return errno == EADDRINUSE ? ListenerBind::kBusy : ListenerBind::kFailed;
+#endif
+}
+
+enum class Peek {
+  kByte,        // *byte received the buffered byte without consuming it.
+  kPeerClosed,  // FIN with the read side drained, or the socket died.
+  kNoData,      // Connected with nothing buffered.
+  kError,       // errno carries the reason.
+};
+
+/// Peeks one byte without consuming it and never blocks, even on a socket
+/// in blocking mode. Linux has recv(MSG_PEEK|MSG_DONTWAIT). Winsock has no
+/// MSG_DONTWAIT, and toggling FIONBIO on the connection would race with the
+/// connection thread's own blocking reads, so peek through a duplicate
+/// handle: Windows keeps blocking mode per handle, not per connection.
+inline Peek PeekByteNonBlocking(int fd, void* byte) noexcept {
+#ifdef _WIN32
+  WSAPROTOCOL_INFOW info{};
+  if (::WSADuplicateSocketW(static_cast<SOCKET>(fd),
+                            static_cast<DWORD>(getpid()), &info) != 0) {
+    detail::SetErrnoFromSocketError();
+    return Peek::kError;
+  }
+  const SOCKET probe = ::WSASocketW(info.iAddressFamily, info.iSocketType,
+                                    info.iProtocol, &info, 0, 0);
+  if (probe == INVALID_SOCKET) {
+    detail::SetErrnoFromSocketError();
+    return Peek::kError;
+  }
+  u_long non_blocking = 1;
+  (void)::ioctlsocket(probe, FIONBIO, &non_blocking);
+  const int n = ::recv(probe, static_cast<char*>(byte), 1, MSG_PEEK);
+  const int error = ::WSAGetLastError();
+  (void)::closesocket(probe);
+  if (n == 1)
+    return Peek::kByte;
+  if (n == 0)
+    return Peek::kPeerClosed;
+  if (error == WSAEWOULDBLOCK)
+    return Peek::kNoData;
+  detail::SetErrnoFromSocketError();
+  return Peek::kError;
+#else
+  const ssize_t n = ::recv(fd, byte, 1, MSG_PEEK | MSG_DONTWAIT);
+  if (n == 1)
+    return Peek::kByte;
+  if (n == 0)
+    return Peek::kPeerClosed;
+  if (errno == EAGAIN || errno == EWOULDBLOCK)
+    return Peek::kNoData;
+  return Peek::kError;
+#endif
+}
+
+/// True without waiting when data arrived or the peer closed or reset the
+/// connection. WSAPoll cannot reliably report POLLHUP for an aborted
+/// connection, but it marks such sockets readable and the peek decides.
+inline bool SocketReadableOrClosed(int fd) noexcept {
+#ifdef _WIN32
+  WSAPOLLFD readable{static_cast<SOCKET>(fd), POLLRDNORM, 0};
+  return ::WSAPoll(&readable, 1, 0) > 0;
+#else
+  pollfd descriptor{
+      .fd = fd,
+      .events = POLLIN | POLLERR | POLLHUP,
+      .revents = 0,
+  };
+#ifdef POLLRDHUP
+  descriptor.events |= POLLRDHUP;
+#endif
+  return ::poll(&descriptor, 1, 0) > 0;
 #endif
 }
 

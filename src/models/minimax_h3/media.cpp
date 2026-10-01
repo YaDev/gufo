@@ -1,8 +1,6 @@
 #include "src/models/minimax_h3/media.hpp"
 
 #include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
 #include <signal.h>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -22,6 +20,8 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include "src/core/platform/cancellable_write.hpp"
 
 #ifndef GUFO_FFMPEG_EXECUTABLE
 #define GUFO_FFMPEG_EXECUTABLE "ffmpeg"
@@ -103,11 +103,10 @@ void CloseFd(int* descriptor) {
   }
 }
 
-bool MakeNonBlocking(int descriptor, std::string* error) {
-  const int flags = fcntl(descriptor, F_GETFL);
-  if (flags < 0 || fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) != 0) {
-    SetError(error, "cannot configure FFmpeg media pipe: " +
-                        std::string(std::strerror(errno)));
+bool MakeCancellable(int descriptor, std::string* error) {
+  std::string reason;
+  if (!platform::PreparePipeForCancellableWrite(descriptor, &reason)) {
+    SetError(error, "cannot configure FFmpeg media pipe: " + reason);
     return false;
   }
   return true;
@@ -116,30 +115,9 @@ bool MakeNonBlocking(int descriptor, std::string* error) {
 ssize_t CancellableWrite(int descriptor, const void* data, std::size_t bytes,
                          const CancellationToken* cancellation,
                          const std::atomic<bool>& stop) {
-  while (!stop.load(std::memory_order_acquire) && !IsCancelled(cancellation)) {
-    const ssize_t amount = write(descriptor, data, bytes);
-    if (amount >= 0) {
-      return amount;
-    }
-    if (errno == EINTR) {
-      continue;
-    }
-    if (errno != EAGAIN && errno != EWOULDBLOCK) {
-      return -1;
-    }
-    struct pollfd readiness{static_cast<decltype(pollfd::fd)>(descriptor),
-                            POLLOUT, 0};
-    const int result = poll(&readiness, 1, 50);
-    if (result < 0 && errno != EINTR) {
-      return -1;
-    }
-    if (result > 0 && (readiness.revents & (POLLERR | POLLHUP | POLLNVAL))) {
-      errno = EPIPE;
-      return -1;
-    }
-  }
-  errno = ECANCELED;
-  return -1;
+  return platform::CancellableWrite(descriptor, data, bytes, [&] {
+    return stop.load(std::memory_order_acquire) || IsCancelled(cancellation);
+  });
 }
 
 int AddCloseUnlessKept(posix_spawn_file_actions_t* actions, int descriptor,
@@ -474,8 +452,8 @@ bool WriteSynchronizedMp4(const std::filesystem::path& path,
     SetError(error, "cannot start FFmpeg: " + std::string(std::strerror(code)));
     return false;
   }
-  if (!MakeNonBlocking(video_pipe[1], error) ||
-      !MakeNonBlocking(audio_pipe[1], error)) {
+  if (!MakeCancellable(video_pipe[1], error) ||
+      !MakeCancellable(audio_pipe[1], error)) {
     CloseFd(&video_pipe[1]);
     CloseFd(&audio_pipe[1]);
     (void)kill(child, SIGTERM);

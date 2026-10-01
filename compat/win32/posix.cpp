@@ -17,6 +17,14 @@
 //   same inode" idiom.
 // - flock() locks one byte far beyond any real file offset, because Windows
 //   byte-range locks are mandatory and would otherwise block ordinary reads.
+// - fcntl(F_SETFL, O_NONBLOCK) applies FIONBIO to sockets. Anonymous pipes
+//   and plain files are only ever synchronous on Windows, so asking to make
+//   one non-blocking fails with ENOTSUP instead of pretending to succeed and
+//   turning the caller's poll loop into an unkillable hang. Writes to pipes
+//   that must stay cancellable go through gufo::platform::CancellableWrite.
+// - poll() dispatches by descriptor kind: sockets to WSAPoll, pipes to
+//   PeekNamedPipe (POLLIN/POLLHUP; write-end POLLOUT cannot be observed on
+//   Windows and waits out the timeout), files as always ready.
 // - mmap() offsets are aligned down to the 64 KiB allocation granularity and
 //   munmap() releases whole views.
 
@@ -26,6 +34,9 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+// Windows headers must precede the CRT block: winsock2 before windows.h, and
+// psapi/winternl need windows.h for BOOL/DWORD. clang-format's include sorting
+// breaks this contract, and tools/ci/check-format.py never formats compat/.
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -58,6 +69,7 @@
 #include <string>
 #include <typeinfo>
 #include <unordered_map>
+#include <vector>
 
 #include "gufo_socket.h"
 
@@ -661,6 +673,83 @@ SYSTEM_INFO SystemInfo() {
 std::mutex g_child_mutex;
 std::unordered_map<pid_t, HANDLE> g_children;
 
+// ---- poll() descriptor classification -------------------------------------
+
+enum FdKind : unsigned char {
+  kFdSocket,
+  kFdPipe,
+  kFdConsole,
+  kFdFile,
+  kFdInvalid,
+};
+
+// Gufo sockets are SOCKET values stored as int. The numeric value of a
+// socket may collide with a CRT descriptor number, so the socket test must
+// run before HandleOf() can be trusted on the same integer.
+FdKind KindOf(int fd) {
+  int type = 0;
+  int length = static_cast<int>(sizeof(type));
+  if (getsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, SO_TYPE,
+                 reinterpret_cast<char*>(&type), &length) != SOCKET_ERROR) {
+    return kFdSocket;
+  }
+  const HANDLE handle = HandleOf(fd);
+  if (handle == INVALID_HANDLE_VALUE) {
+    return kFdInvalid;
+  }
+  switch (GetFileType(handle)) {
+    case FILE_TYPE_PIPE:
+      return kFdPipe;
+    case FILE_TYPE_CHAR:
+      return kFdConsole;
+    case FILE_TYPE_DISK:
+      return kFdFile;
+    default:
+      return kFdInvalid;
+  }
+}
+
+// Read readiness comes from PeekNamedPipe and a closed writer reads as
+// POLLHUP. Write readiness cannot be observed on a Windows pipe (no query
+// reports free buffer space), so POLLOUT on a write end is never reported;
+// callers rely on the write itself completing, which is what
+// gufo::platform::CancellableWrite does.
+bool PipeReady(HANDLE handle, SHORT requested, SHORT* revents) {
+  DWORD available = 0;
+  if (PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr)) {
+    SHORT out = 0;
+    if ((requested & POLLIN) != 0 && available > 0) {
+      out |= POLLIN;
+    }
+    *revents = out;
+    return out != 0;
+  }
+  const DWORD error = GetLastError();
+  if (error == ERROR_BROKEN_PIPE || error == ERROR_NO_DATA) {
+    *revents = POLLHUP;
+    return true;
+  }
+  // PeekNamedPipe needs read access; on a write end there is nothing to
+  // report, so a POLLOUT wait runs to its timeout.
+  *revents = 0;
+  return false;
+}
+
+bool OtherReady(FdKind kind, SHORT requested, SHORT* revents) {
+  if (kind == kFdInvalid) {
+    *revents = POLLNVAL;
+    return true;
+  }
+  if (kind == kFdFile) {
+    *revents = requested;
+    return requested != 0;
+  }
+  // Console output never blocks; console input readiness would require
+  // ReadConsoleInput, which consumes the event, so reads are never-ready.
+  *revents = (requested & POLLOUT) != 0 ? POLLOUT : 0;
+  return *revents != 0;
+}
+
 }  // namespace
 
 extern "C" {
@@ -790,22 +879,53 @@ int posix_fallocate(int fd, off_t offset, off_t length) {
 int posix_fadvise(int, off_t, off_t, int) { return 0; }
 
 int fcntl(int fd, int cmd, ...) {
+  va_list args;
+  va_start(args, cmd);
+  int result = 0;
   switch (cmd) {
     case F_DUPFD:
     case F_DUPFD_CLOEXEC:
-      return dup(fd);
+      result = dup(fd);
+      break;
     case F_GETFD:
-      return FD_CLOEXEC;
+      result = FD_CLOEXEC;
+      break;
     case F_SETFD:
-      return 0;
+      result = 0;
+      break;
     case F_GETFL:
-      return FlagsOf(fd);
-    case F_SETFL:
-      return 0;
+      result = FlagsOf(fd);
+      break;
+    case F_SETFL: {
+      const int flags = va_arg(args, int);
+      if (KindOf(fd) == kFdSocket) {
+        u_long on = (flags & O_NONBLOCK) != 0 ? 1UL : 0UL;
+        if (ioctlsocket(static_cast<SOCKET>(fd), FIONBIO, &on) != 0) {
+          result = Fail(static_cast<DWORD>(WSAGetLastError()));
+          break;
+        }
+        RememberFlags(fd, (FlagsOf(fd) & ~O_NONBLOCK) | (flags & O_NONBLOCK));
+        break;
+      }
+      if ((flags & O_NONBLOCK) != 0) {
+        // Plain pipe and file handles are only ever synchronous here.
+        // Accepting and discarding the flag once turned callers into
+        // unkillable hangs (a "non-blocking" write blocked forever and
+        // its poll() failed with EBADF); fail loudly instead.
+        errno = ENOTSUP;
+        result = -1;
+        break;
+      }
+      RememberFlags(fd, flags);
+      break;
+    }
     default:
       errno = EINVAL;
-      return -1;
+      result = -1;
+      break;
   }
+  va_end(args);
+  return result;
 }
 
 int dup(int fd) {
@@ -1683,23 +1803,91 @@ int sigaddset(sigset_t* set, int sig) {
   return 0;
 }
 
+// WSAPoll rejects anything that is not a socket, so descriptors such as
+// anonymous pipes are emulated here in bounded slices instead of failing
+// the whole call with EBADF.
 int poll(struct pollfd* fds, unsigned long count, int timeout_ms) {
-  constexpr SHORT kOutputOnly = POLLERR | POLLHUP | POLLNVAL | POLLPRI;
-  SHORT requested[64];
-  const unsigned long saved = count < 64 ? count : 64;
-  for (unsigned long i = 0; i < saved; ++i) {
+  constexpr SHORT kRejectedEvents = POLLERR | POLLHUP | POLLNVAL | POLLPRI;
+  constexpr int kSliceMs = 25;
+
+  std::vector<FdKind> kinds(count);
+  std::vector<SHORT> requested(count);
+  std::vector<pollfd> sockets;
+  std::vector<unsigned long> socket_of;
+  bool has_non_socket = false;
+  for (unsigned long i = 0; i < count; ++i) {
     requested[i] = fds[i].events;
-    fds[i].events &= ~kOutputOnly;
+    kinds[i] = KindOf(static_cast<int>(fds[i].fd));
+    if (kinds[i] == kFdSocket) {
+      sockets.push_back(
+          {fds[i].fd, static_cast<SHORT>(fds[i].events & ~kRejectedEvents), 0});
+      socket_of.push_back(i);
+    } else {
+      has_non_socket = true;
+    }
+    fds[i].revents = 0;
   }
-  const int ready = WSAPoll(fds, count, timeout_ms);
-  const int error = ready < 0 ? WSAGetLastError() : 0;
-  for (unsigned long i = 0; i < saved; ++i) {
-    fds[i].events = requested[i];
+  const auto restore_events = [&] {
+    for (unsigned long i = 0; i < count; ++i) {
+      fds[i].events = requested[i];
+    }
+  };
+
+  int remaining = timeout_ms;
+  for (;;) {
+    SHORT non_socket_ready = 0;
+    for (unsigned long i = 0; has_non_socket && i < count; ++i) {
+      if (kinds[i] == kFdSocket) {
+        continue;
+      }
+      SHORT revents = 0;
+      if (kinds[i] == kFdPipe) {
+        PipeReady(HandleOf(static_cast<int>(fds[i].fd)), requested[i],
+                  &revents);
+      } else {
+        OtherReady(kinds[i], requested[i], &revents);
+      }
+      fds[i].revents = revents;
+      if (revents != 0) {
+        ++non_socket_ready;
+      }
+    }
+    const int slice =
+        non_socket_ready > 0 || remaining == 0
+            ? 0
+            : (remaining < 0 || remaining > kSliceMs ? kSliceMs : remaining);
+    int ready = 0;
+    if (!sockets.empty()) {
+      ready = WSAPoll(sockets.data(),
+                      static_cast<unsigned long>(sockets.size()), slice);
+      if (ready < 0) {
+        const int error = WSAGetLastError();
+        restore_events();
+        errno =
+            error == WSAEINTR ? EINTR : (error == WSAENOTSOCK ? EBADF : EINVAL);
+        return -1;
+      }
+    } else if (slice > 0) {
+      Sleep(static_cast<DWORD>(slice));
+    }
+    if (non_socket_ready > 0 || ready > 0 || remaining == 0) {
+      break;
+    }
+    if (remaining > 0) {
+      remaining -= slice;
+    }
   }
-  if (ready < 0) {
-    errno = error == WSAEINTR ? EINTR : (error == WSAENOTSOCK ? EBADF : EINVAL);
+  for (std::size_t j = 0; j < sockets.size(); ++j) {
+    fds[socket_of[j]].revents = sockets[j].revents;
   }
-  return ready;
+  restore_events();
+  int total = 0;
+  for (unsigned long i = 0; i < count; ++i) {
+    if (fds[i].revents != 0) {
+      ++total;
+    }
+  }
+  return total;
 }
 
 }  // extern "C"
@@ -1728,11 +1916,17 @@ int mkdir(const wchar_t* path, mode_t mode) {
   return mkdir(Narrow(path).c_str(), mode);
 }
 
-int rmdir(const wchar_t* path) { return rmdir(Narrow(path).c_str()); }
+int rmdir(const wchar_t* path) {
+  return rmdir(Narrow(path).c_str());
+}
 
-int unlink(const wchar_t* path) { return unlink(Narrow(path).c_str()); }
+int unlink(const wchar_t* path) {
+  return unlink(Narrow(path).c_str());
+}
 
-int chmod(const wchar_t*, mode_t) { return 0; }
+int chmod(const wchar_t*, mode_t) {
+  return 0;
+}
 
 int utimensat(int dirfd, const wchar_t* path, const struct timespec times[2],
               int flags) {

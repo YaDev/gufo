@@ -138,6 +138,8 @@ add_library(gufo_core STATIC
   src/core/json_constraint.cpp
   src/core/json_schema_lexeme.cpp
   src/core/json_schema_regex.cpp
+  src/core/platform/cancellable_write.cpp
+  src/core/platform/fatal_signal.cpp
   src/core/sampling.cpp
   src/models/minimax_h3/audio_vae.cpp
   src/models/minimax_h3/denoiser.cpp
@@ -403,6 +405,11 @@ if (BUILD_TESTING)
   target_link_libraries(json_constraint_test PRIVATE gufo_core)
   add_test(NAME json_constraint_test COMMAND json_constraint_test)
   set_tests_properties(json_constraint_test PROPERTIES LABELS "cpu;json;sampling")
+
+  add_executable(cancellable_write_test tests/core/cancellable_write_test.cpp)
+  target_link_libraries(cancellable_write_test PRIVATE gufo_core)
+  add_test(NAME cancellable_write_test COMMAND cancellable_write_test)
+  set_tests_properties(cancellable_write_test PROPERTIES LABELS "cpu")
 
   add_executable(json_test tests/core/json_test.cpp)
   target_link_libraries(json_test PRIVATE gufo_core)

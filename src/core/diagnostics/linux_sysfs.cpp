@@ -40,7 +40,8 @@ std::uint32_t ParseUint(std::string_view str) {
 LinuxSysfs::LinuxSysfs(const std::filesystem::path& sys_root,
                        const std::filesystem::path& proc_root)
     : sys_root_(std::filesystem::absolute(sys_root)),
-      proc_root_(std::filesystem::absolute(proc_root)) {}
+      proc_root_(std::filesystem::absolute(proc_root)),
+      default_roots_(proc_root == "/proc" && sys_root == "/sys") {}
 
 std::optional<std::string> LinuxSysfs::ReadFile(
     const std::filesystem::path& path) const {
@@ -105,7 +106,9 @@ std::optional<HostCpuInfo> LinuxSysfs::QueryCpuInfo() const {
   const auto content_opt = ReadFile(proc_root_ / "cpuinfo");
   if (!content_opt) {
 #ifdef _WIN32
-    if (proc_root_ == "/proc")
+    // Branch on the intent captured before absolute() normalisation; the
+    // normalised path can never compare equal to "/proc" on Windows.
+    if (default_roots_)
       return WindowsCpuInfo();
 #endif
     return std::nullopt;
@@ -156,7 +159,7 @@ std::optional<HostMemInfo> LinuxSysfs::QueryMemInfo() const {
   const auto content_opt = ReadFile(proc_root_ / "meminfo");
   if (!content_opt) {
 #ifdef _WIN32
-    if (proc_root_ == "/proc") {
+    if (default_roots_) {
       HostMemInfo windows;
       windows.total_bytes = gufo_total_physical_bytes();
       windows.available_bytes = gufo_available_physical_bytes();

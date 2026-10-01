@@ -31,8 +31,9 @@ typedef unsigned long nfds_t;
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* WSAPoll with POSIX semantics: POLLERR/POLLHUP/POLLNVAL are accepted in
- * `events` (WSAPoll rejects them with WSAEINVAL) and errno is set. */
+/* poll(2) with POSIX semantics: POLLERR/POLLHUP/POLLNVAL are accepted in
+ * `events` (WSAPoll rejects them with WSAEINVAL), errno is set, and
+ * non-socket descriptors (pipes, files) are emulated instead of failing. */
 int poll(struct pollfd* fds, unsigned long count, int timeout_ms);
 #ifdef __cplusplus
 }

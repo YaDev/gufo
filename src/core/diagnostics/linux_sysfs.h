@@ -61,6 +61,10 @@ public:
 private:
   std::filesystem::path sys_root_;
   std::filesystem::path proc_root_;
+  // True when the caller asked for the real Linux roots. Captured from the
+  // raw arguments because std::filesystem::absolute("/proc") yields the
+  // current drive's root on Windows, which no longer compares equal.
+  const bool default_roots_;
 };
 
 }  // namespace gufo::diagnostics
